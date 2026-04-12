@@ -19,6 +19,10 @@ const HIGH_BOT_SCORE_THRESHOLD = 15;
 const LOW_BOT_SCORE_THRESHOLD = 35;
 const HIGH_THREAT_SCORE_THRESHOLD = 20;
 const LOW_THREAT_SCORE_THRESHOLD = 5;
+const HIGH_RISK_SCORE_THRESHOLD = 7;
+const LOW_RISK_SCORE_THRESHOLD = 3;
+
+const AUTOMATION_UA_PATTERN = /(curl|wget|python-requests|aiohttp|httpclient|okhttp|go-http-client|powershell|java\/|libwww-perl|scrapy|postmanruntime|insomnia|node-fetch|axios)/i;
 
 const RISK_LEVEL = Object.freeze({
   CLEAN: 'clean',
@@ -133,14 +137,25 @@ function isTurnstileConfigured() {
   return Boolean(TURNSTILE_SITE_KEY && TURNSTILE_SECRET_KEY);
 }
 
+function getHttpProtocol(request) {
+  const cf = request.cf || {};
+  if (typeof cf.httpProtocol === 'string' && cf.httpProtocol) {
+    return cf.httpProtocol.toUpperCase();
+  }
+  return '';
+}
+
 function getRiskLevel(request) {
+  const headers = request.headers;
   const cf = request.cf || {};
   const threatScore = Number.isFinite(cf.threatScore) ? cf.threatScore : null;
   const botScore = cf.botManagement && Number.isFinite(cf.botManagement.score)
     ? cf.botManagement.score
     : null;
-  const ua = (request.headers.get('User-Agent') || '').trim();
-  const accept = (request.headers.get('Accept') || '').trim();
+  const ua = (headers.get('User-Agent') || '').trim();
+  const accept = (headers.get('Accept') || '').trim().toLowerCase();
+
+  let score = 0;
 
   if (threatScore !== null && threatScore >= HIGH_THREAT_SCORE_THRESHOLD) {
     return RISK_LEVEL.HIGH;
@@ -150,13 +165,57 @@ function getRiskLevel(request) {
     return RISK_LEVEL.HIGH;
   }
 
-  let lowSignals = 0;
-  if (threatScore !== null && threatScore >= LOW_THREAT_SCORE_THRESHOLD) lowSignals += 1;
-  if (botScore !== null && botScore <= LOW_BOT_SCORE_THRESHOLD) lowSignals += 1;
-  if (!ua || ua.length < 12) lowSignals += 1;
-  if (!accept || accept === '*/*') lowSignals += 1;
+  if (threatScore !== null && threatScore >= LOW_THREAT_SCORE_THRESHOLD) score += 2;
+  if (botScore !== null && botScore <= LOW_BOT_SCORE_THRESHOLD) score += 2;
 
-  if (lowSignals > 0) return RISK_LEVEL.LOW;
+  if (!ua) {
+    score += 3;
+  } else {
+    if (ua.length < 18) score += 2;
+    if (AUTOMATION_UA_PATTERN.test(ua)) score += 4;
+  }
+
+  if (!accept) {
+    score += 2;
+  } else if (accept === '*/*') {
+    score += 1;
+  }
+
+  const acceptLanguage = (headers.get('Accept-Language') || '').trim();
+  if (!acceptLanguage) score += 1;
+
+  const secFetchSite = (headers.get('Sec-Fetch-Site') || '').trim();
+  const secFetchMode = (headers.get('Sec-Fetch-Mode') || '').trim();
+  const secFetchDest = (headers.get('Sec-Fetch-Dest') || '').trim();
+  if (!secFetchSite) score += 1;
+  if (!secFetchMode) score += 1;
+  if (!secFetchDest) score += 1;
+
+  const secChUa = (headers.get('Sec-CH-UA') || '').trim();
+  if (!secChUa && ua) score += 1;
+
+  const httpProtocol = getHttpProtocol(request);
+  if (httpProtocol === 'HTTP/1.0') {
+    score += 4;
+  } else if (httpProtocol === 'HTTP/1.1') {
+    score += 1;
+  }
+
+  const connection = (headers.get('Connection') || '').trim().toLowerCase();
+  if ((httpProtocol === 'HTTP/2' || httpProtocol === 'HTTP/3') && connection) {
+    score += 2;
+  }
+  if (httpProtocol === 'HTTP/1.1' && connection === 'close') {
+    score += 1;
+  }
+
+  const tlsVersion = typeof cf.tlsVersion === 'string' ? cf.tlsVersion.toUpperCase() : '';
+  if (tlsVersion === 'TLSV1' || tlsVersion === 'TLSV1.1') {
+    score += 2;
+  }
+
+  if (score >= HIGH_RISK_SCORE_THRESHOLD) return RISK_LEVEL.HIGH;
+  if (score >= LOW_RISK_SCORE_THRESHOLD) return RISK_LEVEL.LOW;
   return RISK_LEVEL.CLEAN;
 }
 
