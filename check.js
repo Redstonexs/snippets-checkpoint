@@ -21,8 +21,26 @@ const HIGH_THREAT_SCORE_THRESHOLD = 20;
 const LOW_THREAT_SCORE_THRESHOLD = 5;
 const HIGH_RISK_SCORE_THRESHOLD = 7;
 const LOW_RISK_SCORE_THRESHOLD = 3;
+const HTTP11_POW_SCORE_BONUS = 3;
+const ASN_POW_SCORE_BONUS = 3;
 
 const AUTOMATION_UA_PATTERN = /(curl|wget|python-requests|aiohttp|httpclient|okhttp|go-http-client|powershell|java\/|libwww-perl|scrapy|postmanruntime|insomnia|node-fetch|axios)/i;
+
+// Tune this list with your production threat intel and traffic logs.
+const BOT_HEAVY_ASNS = new Set([
+  16509, // Amazon
+  14618, // Amazon
+  14061, // DigitalOcean
+  8075, // Microsoft
+  15169, // Google
+  16276, // OVH
+  24940, // Hetzner
+  20473, // Vultr
+  63949, // Linode
+  31898, // Oracle Cloud
+  60068, // Datacamp Limited / data center usage
+  132203 // Tencent Cloud
+]);
 
 const RISK_LEVEL = Object.freeze({
   CLEAN: 'clean',
@@ -145,6 +163,21 @@ function getHttpProtocol(request) {
   return '';
 }
 
+function getAsnNumber(request) {
+  const cf = request.cf || {};
+
+  if (Number.isFinite(cf.asn)) {
+    return cf.asn;
+  }
+
+  if (typeof cf.asn === 'string' && cf.asn) {
+    const parsed = Number.parseInt(cf.asn, 10);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+
+  return null;
+}
+
 function getRiskLevel(request) {
   const headers = request.headers;
   const cf = request.cf || {};
@@ -154,6 +187,7 @@ function getRiskLevel(request) {
     : null;
   const ua = (headers.get('User-Agent') || '').trim();
   const accept = (headers.get('Accept') || '').trim().toLowerCase();
+  const asn = getAsnNumber(request);
 
   let score = 0;
 
@@ -198,7 +232,11 @@ function getRiskLevel(request) {
   if (httpProtocol === 'HTTP/1.0') {
     score += 4;
   } else if (httpProtocol === 'HTTP/1.1') {
-    score += 1;
+    score += HTTP11_POW_SCORE_BONUS;
+  }
+
+  if (asn !== null && BOT_HEAVY_ASNS.has(asn)) {
+    score += ASN_POW_SCORE_BONUS;
   }
 
   const connection = (headers.get('Connection') || '').trim().toLowerCase();
