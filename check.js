@@ -5,6 +5,7 @@ const TURNSTILE_SECRET_KEY = '';
 
 const TOKEN_COOKIE = 'cf_token';
 const COOKIE_MAX_AGE = 300;
+const FAIL_OPEN_ON_MISCONFIG = true;
 
 const TURNSTILE_VERIFY_PATH = '/__cf-turnstile/verify';
 const TURNSTILE_VERIFY_API = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
@@ -106,6 +107,22 @@ function noStoreHeaders(extraHeaders = {}) {
     'Cache-Control': 'no-store, no-cache, must-revalidate',
     ...extraHeaders
   };
+}
+
+function isChallengeEligibleRequest(request) {
+  const method = (request.method || 'GET').toUpperCase();
+  if (method !== 'GET' && method !== 'HEAD') return false;
+
+  const accept = (request.headers.get('Accept') || '').toLowerCase();
+  if (!accept.includes('text/html')) return false;
+
+  const secFetchDest = (request.headers.get('Sec-Fetch-Dest') || '').toLowerCase();
+  if (secFetchDest && secFetchDest !== 'document' && secFetchDest !== 'empty') return false;
+
+  const secFetchMode = (request.headers.get('Sec-Fetch-Mode') || '').toLowerCase();
+  if (secFetchMode && secFetchMode !== 'navigate') return false;
+
+  return true;
 }
 
 function buildCookie(token) {
@@ -606,21 +623,53 @@ async function handleTurnstileVerification(request, key) {
 export default {
   async fetch(request) {
     try {
-      if (!SECRET_KEY) {
-        return misconfiguredSecretResponse();
-      }
-
       const url = new URL(request.url);
-      const key = await getCachedKey();
 
       if (url.pathname === POW_VERIFY_PATH && request.method === 'POST') {
+        if (!SECRET_KEY) {
+          if (FAIL_OPEN_ON_MISCONFIG) {
+            return new Response(null, {
+              status: 303,
+              headers: noStoreHeaders({ Location: safeReturnPath(url.searchParams.get('return_to') || '/') })
+            });
+          }
+          return misconfiguredSecretResponse();
+        }
+
+        const key = await getCachedKey();
         return handlePowVerification(request, key);
       }
 
       if (url.pathname === TURNSTILE_VERIFY_PATH && request.method === 'POST') {
-        if (!isTurnstileConfigured()) return misconfiguredTurnstileResponse();
+        if (!SECRET_KEY) {
+          if (FAIL_OPEN_ON_MISCONFIG) {
+            return new Response(null, {
+              status: 303,
+              headers: noStoreHeaders({ Location: safeReturnPath(url.searchParams.get('return_to') || '/') })
+            });
+          }
+          return misconfiguredSecretResponse();
+        }
+
+        const key = await getCachedKey();
+        if (!isTurnstileConfigured()) {
+          if (FAIL_OPEN_ON_MISCONFIG) {
+            return handlePowVerification(request, key);
+          }
+          return misconfiguredTurnstileResponse();
+        }
+
         return handleTurnstileVerification(request, key);
       }
+
+      if (!SECRET_KEY) {
+        if (FAIL_OPEN_ON_MISCONFIG) return fetch(request);
+        return misconfiguredSecretResponse();
+      }
+      const key = await getCachedKey();
+
+      // Never return HTML challenges to API/subresource calls.
+      const canChallenge = isChallengeEligibleRequest(request);
 
       const riskLevel = getRiskLevel(request);
       if (riskLevel === RISK_LEVEL.CLEAN) {
@@ -637,10 +686,20 @@ export default {
         return fetch(request);
       }
 
+      if (!canChallenge) {
+        return fetch(request);
+      }
+
       const returnTo = safeReturnPath(`${url.pathname}${url.search}`);
 
       if (riskLevel === RISK_LEVEL.HIGH) {
-        if (!isTurnstileConfigured()) return misconfiguredTurnstileResponse();
+        if (!isTurnstileConfigured()) {
+          if (FAIL_OPEN_ON_MISCONFIG) {
+            return buildPowChallengeResponse(returnTo, clientIP, key, 'Turnstile unavailable, using PoW fallback.');
+          }
+          return misconfiguredTurnstileResponse();
+        }
+
         return new Response(renderTurnstilePage(returnTo), {
           status: 403,
           headers: noStoreHeaders({ 'Content-Type': 'text/html; charset=utf-8' })
