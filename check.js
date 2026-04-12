@@ -1,149 +1,655 @@
-// 可直接放到 Cloudflare Snippets 中（注意：生产环境请替换 SECRET_KEY）
+// Fill these keys before production rollout.
 const SECRET_KEY = '';
+const TURNSTILE_SITE_KEY = '';
+const TURNSTILE_SECRET_KEY = '';
+
 const TOKEN_COOKIE = 'cf_token';
-const COOKIE_MAX_AGE = 300; // token 有效期（秒）
+const COOKIE_MAX_AGE = 300;
+
+const TURNSTILE_VERIFY_PATH = '/__cf-turnstile/verify';
+const TURNSTILE_VERIFY_API = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+
+const POW_VERIFY_PATH = '/__cf-pow/verify';
+const POW_DIFFICULTY = 4;
+const POW_MAX_DIFFICULTY = 6;
+const POW_CHALLENGE_TTL = 120;
+
+const HIGH_BOT_SCORE_THRESHOLD = 15;
+const LOW_BOT_SCORE_THRESHOLD = 35;
+const HIGH_THREAT_SCORE_THRESHOLD = 20;
+const LOW_THREAT_SCORE_THRESHOLD = 5;
+
+const RISK_LEVEL = Object.freeze({
+  CLEAN: 'clean',
+  LOW: 'low',
+  HIGH: 'high'
+});
+
+const PASS_LEVEL = Object.freeze({
+  POW: 'pow',
+  TURNSTILE: 'turnstile'
+});
+
 const encoder = new TextEncoder();
 
-// 缓存导入的 CryptoKey
-let _cachedKey = null;
+let cachedKey = null;
 async function getCachedKey() {
-  if (_cachedKey) return _cachedKey;
-  _cachedKey = await crypto.subtle.importKey(
+  if (cachedKey) return cachedKey;
+  cachedKey = await crypto.subtle.importKey(
     'raw',
     encoder.encode(SECRET_KEY),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign', 'verify']
   );
-  return _cachedKey;
+  return cachedKey;
 }
 
-// ArrayBuffer -> hex
 function bufToHex(buf) {
   const bytes = new Uint8Array(buf);
-  let s = '';
+  let out = '';
   for (let i = 0; i < bytes.length; i++) {
-    s += ('0' + bytes[i].toString(16)).slice(-2);
-  }
-  return s;
-}
-// hex -> Uint8Array
-function hexToUint8Array(hex) {
-  if (!hex) return new Uint8Array();
-  const len = hex.length / 2;
-  const out = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    out += bytes[i].toString(16).padStart(2, '0');
   }
   return out;
 }
 
-// 解析 Cookie（更稳健，处理 value 中可能含 '=' 的情况）
+function hexToUint8Array(hex) {
+  if (!hex || hex.length % 2 !== 0) return new Uint8Array();
+  const len = hex.length / 2;
+  const out = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+function isHexString(value) {
+  return typeof value === 'string' && /^[0-9a-f]+$/i.test(value);
+}
+
 function getCookie(cookieHeader, name) {
   if (!cookieHeader) return null;
   const parts = cookieHeader.split(';');
-  for (let p of parts) {
-    const idx = p.indexOf('=');
+  for (let i = 0; i < parts.length; i++) {
+    const item = parts[i];
+    const idx = item.indexOf('=');
     if (idx === -1) continue;
-    const k = p.slice(0, idx).trim();
-    const v = p.slice(idx + 1).trim();
-    if (k === name) return decodeURIComponent(v);
+    const key = item.slice(0, idx).trim();
+    const value = item.slice(idx + 1).trim();
+    if (key === name) return decodeURIComponent(value);
   }
   return null;
 }
 
-// 生成 challenge 响应（含 Set-Cookie + 可见的 HTML + meta content）
-async function challengeResponse(clientIP, key) {
-  const now = Math.floor(Date.now() / 1000);
-  const expiry = now + COOKIE_MAX_AGE;
-  const payload = `${clientIP}:${expiry}`;
-  const macBuf = await crypto.subtle.sign('HMAC', key, encoder.encode(payload));
-  const macHex = bufToHex(macBuf);
-  const newToken = `${expiry}:${macHex}`;
+function nowInSeconds() {
+  return Math.floor(Date.now() / 1000);
+}
 
-  const cookieVal = encodeURIComponent(newToken);
-  const cookieStr = `${TOKEN_COOKIE}=${cookieVal}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${COOKIE_MAX_AGE}`;
+function safeReturnPath(rawValue) {
+  if (typeof rawValue !== 'string' || rawValue.length === 0) return '/';
+  if (!rawValue.startsWith('/') || rawValue.startsWith('//')) return '/';
+  return rawValue;
+}
 
-  // 可见的 challenge 页面：显示“正在验证”，并在 800ms 后自动刷新（让浏览器带上 Set-Cookie 重试）
-  const body = `<!doctype html>
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function noStoreHeaders(extraHeaders = {}) {
+  return {
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+    ...extraHeaders
+  };
+}
+
+function buildCookie(token) {
+  return `${TOKEN_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE}`;
+}
+
+function isTurnstileConfigured() {
+  return Boolean(TURNSTILE_SITE_KEY && TURNSTILE_SECRET_KEY);
+}
+
+function getRiskLevel(request) {
+  const cf = request.cf || {};
+  const threatScore = Number.isFinite(cf.threatScore) ? cf.threatScore : null;
+  const botScore = cf.botManagement && Number.isFinite(cf.botManagement.score)
+    ? cf.botManagement.score
+    : null;
+  const ua = (request.headers.get('User-Agent') || '').trim();
+  const accept = (request.headers.get('Accept') || '').trim();
+
+  if (threatScore !== null && threatScore >= HIGH_THREAT_SCORE_THRESHOLD) {
+    return RISK_LEVEL.HIGH;
+  }
+
+  if (botScore !== null && botScore <= HIGH_BOT_SCORE_THRESHOLD) {
+    return RISK_LEVEL.HIGH;
+  }
+
+  let lowSignals = 0;
+  if (threatScore !== null && threatScore >= LOW_THREAT_SCORE_THRESHOLD) lowSignals += 1;
+  if (botScore !== null && botScore <= LOW_BOT_SCORE_THRESHOLD) lowSignals += 1;
+  if (!ua || ua.length < 12) lowSignals += 1;
+  if (!accept || accept === '*/*') lowSignals += 1;
+
+  if (lowSignals > 0) return RISK_LEVEL.LOW;
+  return RISK_LEVEL.CLEAN;
+}
+
+async function issuePassToken(clientIP, key, passLevel) {
+  if (passLevel !== PASS_LEVEL.POW && passLevel !== PASS_LEVEL.TURNSTILE) {
+    return null;
+  }
+
+  const expiry = nowInSeconds() + COOKIE_MAX_AGE;
+  const payload = `${clientIP}:${passLevel}:${expiry}`;
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(payload));
+  return `${passLevel}:${expiry}:${bufToHex(signature)}`;
+}
+
+async function parseAndValidatePassToken(token, clientIP, key) {
+  if (!token) return { valid: false, level: null };
+
+  const parts = token.split(':');
+  if (parts.length !== 3) return { valid: false, level: null };
+
+  const level = parts[0];
+  const expiry = Number.parseInt(parts[1], 10);
+  const signatureHex = parts[2];
+
+  if (level !== PASS_LEVEL.POW && level !== PASS_LEVEL.TURNSTILE) {
+    return { valid: false, level: null };
+  }
+
+  if (!Number.isFinite(expiry) || nowInSeconds() > expiry) {
+    return { valid: false, level: null };
+  }
+
+  const signatureBytes = hexToUint8Array(signatureHex);
+  if (signatureBytes.length === 0) return { valid: false, level: null };
+
+  try {
+    const payload = `${clientIP}:${level}:${expiry}`;
+    const ok = await crypto.subtle.verify('HMAC', key, signatureBytes, encoder.encode(payload));
+    if (!ok) return { valid: false, level: null };
+    return { valid: true, level };
+  } catch (_err) {
+    return { valid: false, level: null };
+  }
+}
+
+function renderTurnstilePage(returnTo, errorText) {
+  const safeReturnTo = escapeHtml(returnTo);
+  const message = errorText
+    ? `<p class="error">${escapeHtml(errorText)}</p>`
+    : '<p class="hint">High-risk traffic requires a human verification.</p>';
+
+  return `<!doctype html>
 <html>
   <head>
-    <meta name="check" content="${newToken}">
-    <meta charset="utf-8"/>
-    <title>Verifying...</title>
-    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Security Verification</title>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
     <style>
-      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f7f7f8;color:#222}
-      .card{padding:24px 28px;border-radius:10px;background:#fff;box-shadow:0 6px 20px rgba(0,0,0,0.08);text-align:center}
+      :root { color-scheme: light; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font-family: ui-sans-serif, -apple-system, Segoe UI, Arial, sans-serif;
+        background: radial-gradient(circle at 15% 20%, #fff2f2 0%, #fff8f7 40%, #f8f8fb 100%);
+        color: #172235;
+      }
+      .card {
+        width: min(92vw, 430px);
+        box-sizing: border-box;
+        padding: 24px;
+        border-radius: 14px;
+        background: #ffffff;
+        border: 1px solid #f0dada;
+        box-shadow: 0 12px 30px rgba(67, 16, 16, 0.08);
+      }
+      h1 {
+        margin: 0 0 10px;
+        font-size: 20px;
+        line-height: 1.3;
+      }
+      .hint {
+        margin: 0 0 18px;
+        color: #5d6779;
+      }
+      .error {
+        margin: 0 0 18px;
+        color: #b3261e;
+        font-weight: 600;
+      }
+      .submit {
+        margin-top: 16px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 42px;
+        border: 0;
+        border-radius: 10px;
+        background: #cc2936;
+        color: #fff;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .submit:hover { background: #ad2230; }
+      .submit:active { transform: translateY(1px); }
     </style>
   </head>
   <body>
-    <div class="card">
-      <h3>正在验证浏览器…</h3>
-      <p>请稍候，验证成功后会自动继续。</p>
-      <small>If this screen persists, enable JavaScript or contact the site owner.</small>
-    </div>
-    <script>
-      // 等待浏览器接收 Set-Cookie（HttpOnly cookie 由响应头设置），然后重载页面以带上 cookie。
-      // 800ms 是经验值，避免立刻重试导致 cookie 尚未生效。若你的环境需要可调整或用更复杂的 handshake。
-      setTimeout(function(){ try { location.reload(); } catch(e) {} }, 800);
-    </script>
-    <noscript>
-      <div style="position:fixed;left:0;right:0;bottom:8px;background:#fff;padding:8px;text-align:center;">
-        JavaScript 被禁用 — 请启用后重试。
-      </div>
-    </noscript>
+    <main class="card">
+      <h1>Security Check</h1>
+      ${message}
+      <form method="POST" action="${TURNSTILE_VERIFY_PATH}">
+        <input type="hidden" name="return_to" value="${safeReturnTo}" />
+        <div class="cf-turnstile" data-sitekey="${escapeHtml(TURNSTILE_SITE_KEY)}"></div>
+        <button class="submit" type="submit">Continue</button>
+      </form>
+    </main>
   </body>
 </html>`;
+}
 
-  return new Response(body, {
-    status: 403,
-    headers: {
-      'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'no-store, no-cache, must-revalidate',
-      'Set-Cookie': cookieStr
-    }
+function randomHex(byteLength) {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return bufToHex(bytes.buffer);
+}
+
+async function issuePowChallenge(clientIP, key) {
+  const nonce = randomHex(16);
+  const expiry = nowInSeconds() + POW_CHALLENGE_TTL;
+  const difficulty = POW_DIFFICULTY;
+  const payload = `pow:${clientIP}:${nonce}:${expiry}:${difficulty}`;
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(payload));
+
+  return {
+    nonce,
+    expiry,
+    difficulty,
+    signature: bufToHex(signature)
+  };
+}
+
+function renderPowPage(challenge, returnTo, errorText) {
+  const safeReturnTo = escapeHtml(returnTo);
+  const message = errorText
+    ? `<p class="error">${escapeHtml(errorText)}</p>`
+    : '<p class="hint">Low-risk suspicious traffic must complete a PoW check.</p>';
+
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Proof of Work</title>
+    <style>
+      :root { color-scheme: light; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font-family: ui-sans-serif, -apple-system, Segoe UI, Arial, sans-serif;
+        background: radial-gradient(circle at 10% 10%, #f2fff8 0%, #f6fffb 35%, #f3f7ff 100%);
+        color: #172235;
+      }
+      .card {
+        width: min(92vw, 500px);
+        box-sizing: border-box;
+        padding: 24px;
+        border-radius: 14px;
+        background: #ffffff;
+        border: 1px solid #d5eee2;
+        box-shadow: 0 12px 30px rgba(16, 67, 42, 0.10);
+      }
+      h1 {
+        margin: 0 0 10px;
+        font-size: 20px;
+        line-height: 1.3;
+      }
+      .hint {
+        margin: 0 0 12px;
+        color: #4f5f76;
+      }
+      .error {
+        margin: 0 0 12px;
+        color: #b3261e;
+        font-weight: 600;
+      }
+      .meta {
+        margin: 0 0 12px;
+        color: #6f7a8f;
+        font-size: 13px;
+      }
+      .status {
+        margin: 8px 0 0;
+        color: #1e3a8a;
+        font-weight: 600;
+      }
+      .noscript {
+        margin-top: 12px;
+        color: #9a3412;
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <h1>Proof of Work</h1>
+      ${message}
+      <p class="meta">Difficulty: ${challenge.difficulty} leading zeroes, expires in ${POW_CHALLENGE_TTL}s.</p>
+      <p id="pow-status" class="status">Preparing challenge...</p>
+
+      <form id="pow-form" method="POST" action="${POW_VERIFY_PATH}"
+        data-nonce="${escapeHtml(challenge.nonce)}"
+        data-difficulty="${challenge.difficulty}">
+        <input type="hidden" name="return_to" value="${safeReturnTo}" />
+        <input type="hidden" name="nonce" value="${escapeHtml(challenge.nonce)}" />
+        <input type="hidden" name="expiry" value="${challenge.expiry}" />
+        <input type="hidden" name="difficulty" value="${challenge.difficulty}" />
+        <input type="hidden" name="signature" value="${escapeHtml(challenge.signature)}" />
+        <input id="pow-answer" type="hidden" name="pow_answer" value="" />
+      </form>
+
+      <noscript>
+        <p class="noscript">JavaScript is required to complete proof of work.</p>
+      </noscript>
+    </main>
+
+    <script>
+      (async function () {
+        const statusNode = document.getElementById('pow-status');
+        const form = document.getElementById('pow-form');
+        const answerInput = document.getElementById('pow-answer');
+        const nonce = String(form.dataset.nonce || '');
+        const difficulty = Number(form.dataset.difficulty || 0);
+        const targetPrefix = '0'.repeat(difficulty);
+
+        const localEncoder = new TextEncoder();
+        function toHex(buffer) {
+          const bytes = new Uint8Array(buffer);
+          let out = '';
+          for (let i = 0; i < bytes.length; i++) {
+            out += bytes[i].toString(16).padStart(2, '0');
+          }
+          return out;
+        }
+
+        async function digestHex(text) {
+          const hash = await crypto.subtle.digest('SHA-256', localEncoder.encode(text));
+          return toHex(hash);
+        }
+
+        let attempt = 0;
+        const startedAt = Date.now();
+        statusNode.textContent = 'Computing proof of work...';
+
+        while (true) {
+          const hashHex = await digestHex(nonce + ':' + attempt);
+          if (hashHex.slice(0, difficulty) === targetPrefix) {
+            answerInput.value = String(attempt);
+            statusNode.textContent = 'Solved. Redirecting...';
+            form.submit();
+            return;
+          }
+
+          attempt += 1;
+          if (attempt % 250 === 0) {
+            const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+            statusNode.textContent = 'Computing proof of work... attempts: ' + attempt + ', ' + elapsed + 's';
+            await new Promise(function (resolve) { setTimeout(resolve, 0); });
+          }
+        }
+      })();
+    </script>
+  </body>
+</html>`;
+}
+
+async function verifyPowSubmission(form, clientIP, key) {
+  const nonce = form.get('nonce');
+  const expiryRaw = form.get('expiry');
+  const difficultyRaw = form.get('difficulty');
+  const signatureHex = form.get('signature');
+  const answer = form.get('pow_answer');
+
+  if (typeof nonce !== 'string' || !isHexString(nonce) || nonce.length < 16 || nonce.length > 64) {
+    return { success: false, message: 'Invalid challenge nonce.' };
+  }
+
+  if (typeof expiryRaw !== 'string' || typeof difficultyRaw !== 'string') {
+    return { success: false, message: 'Invalid challenge metadata.' };
+  }
+
+  const expiry = Number.parseInt(expiryRaw, 10);
+  const difficulty = Number.parseInt(difficultyRaw, 10);
+  if (!Number.isFinite(expiry) || !Number.isFinite(difficulty)) {
+    return { success: false, message: 'Invalid challenge parameters.' };
+  }
+
+  if (difficulty < 1 || difficulty > POW_MAX_DIFFICULTY) {
+    return { success: false, message: 'Unsupported challenge difficulty.' };
+  }
+
+  if (nowInSeconds() > expiry) {
+    return { success: false, message: 'PoW challenge expired. Please retry.' };
+  }
+
+  if (typeof signatureHex !== 'string' || !isHexString(signatureHex) || signatureHex.length !== 64) {
+    return { success: false, message: 'Invalid challenge signature.' };
+  }
+
+  const signatureBytes = hexToUint8Array(signatureHex);
+  const signedPayload = `pow:${clientIP}:${nonce}:${expiry}:${difficulty}`;
+
+  let signatureOK = false;
+  try {
+    signatureOK = await crypto.subtle.verify('HMAC', key, signatureBytes, encoder.encode(signedPayload));
+  } catch (_err) {
+    signatureOK = false;
+  }
+
+  if (!signatureOK) {
+    return { success: false, message: 'Challenge signature mismatch.' };
+  }
+
+  if (typeof answer !== 'string' || !/^[0-9]{1,15}$/.test(answer)) {
+    return { success: false, message: 'PoW answer is missing.' };
+  }
+
+  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(`${nonce}:${answer}`));
+  const digestHex = bufToHex(digest);
+  if (!digestHex.startsWith('0'.repeat(difficulty))) {
+    return { success: false, message: 'PoW answer is invalid.' };
+  }
+
+  return { success: true };
+}
+
+async function buildPowChallengeResponse(returnTo, clientIP, key, errorText, statusCode = 403) {
+  const challenge = await issuePowChallenge(clientIP, key);
+  return new Response(renderPowPage(challenge, returnTo, errorText), {
+    status: statusCode,
+    headers: noStoreHeaders({ 'Content-Type': 'text/html; charset=utf-8' })
+  });
+}
+
+async function verifyTurnstileToken(turnstileToken, clientIP) {
+  const body = new URLSearchParams();
+  body.set('secret', TURNSTILE_SECRET_KEY);
+  body.set('response', turnstileToken);
+  if (clientIP) body.set('remoteip', clientIP);
+
+  const resp = await fetch(TURNSTILE_VERIFY_API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body
+  });
+
+  if (!resp.ok) {
+    return { success: false, errors: [`http_${resp.status}`] };
+  }
+
+  const json = await resp.json();
+  const errors = Array.isArray(json['error-codes']) ? json['error-codes'] : [];
+  return { success: json.success === true, errors };
+}
+
+function misconfiguredSecretResponse() {
+  return new Response('SECRET_KEY is not configured.', {
+    status: 503,
+    headers: noStoreHeaders({ 'Content-Type': 'text/plain; charset=utf-8' })
+  });
+}
+
+function misconfiguredTurnstileResponse() {
+  return new Response('Turnstile is not configured.', {
+    status: 503,
+    headers: noStoreHeaders({ 'Content-Type': 'text/plain; charset=utf-8' })
+  });
+}
+
+async function handlePowVerification(request, key) {
+  const clientIP = request.headers.get('CF-Connecting-IP') || '';
+
+  let form;
+  try {
+    form = await request.formData();
+  } catch (_err) {
+    return new Response('Bad Request', { status: 400 });
+  }
+
+  const returnTo = safeReturnPath(form.get('return_to'));
+  const verifyResult = await verifyPowSubmission(form, clientIP, key);
+
+  if (!verifyResult.success) {
+    return buildPowChallengeResponse(returnTo, clientIP, key, verifyResult.message);
+  }
+
+  const token = await issuePassToken(clientIP, key, PASS_LEVEL.POW);
+  return new Response(null, {
+    status: 303,
+    headers: noStoreHeaders({
+      Location: returnTo,
+      'Set-Cookie': buildCookie(token)
+    })
+  });
+}
+
+async function handleTurnstileVerification(request, key) {
+  const clientIP = request.headers.get('CF-Connecting-IP') || '';
+
+  let form;
+  try {
+    form = await request.formData();
+  } catch (_err) {
+    return new Response('Bad Request', { status: 400 });
+  }
+
+  const returnTo = safeReturnPath(form.get('return_to'));
+  const turnstileToken = form.get('cf-turnstile-response');
+
+  if (typeof turnstileToken !== 'string' || !turnstileToken) {
+    return new Response(renderTurnstilePage(returnTo, 'Turnstile token is missing.'), {
+      status: 403,
+      headers: noStoreHeaders({ 'Content-Type': 'text/html; charset=utf-8' })
+    });
+  }
+
+  let verifyResult;
+  try {
+    verifyResult = await verifyTurnstileToken(turnstileToken, clientIP);
+  } catch (_err) {
+    return new Response(renderTurnstilePage(returnTo, 'Verification service is unavailable.'), {
+      status: 503,
+      headers: noStoreHeaders({ 'Content-Type': 'text/html; charset=utf-8' })
+    });
+  }
+
+  if (!verifyResult.success) {
+    const firstError = verifyResult.errors.length > 0
+      ? `Verification failed: ${verifyResult.errors[0]}`
+      : 'Verification failed, please try again.';
+
+    return new Response(renderTurnstilePage(returnTo, firstError), {
+      status: 403,
+      headers: noStoreHeaders({ 'Content-Type': 'text/html; charset=utf-8' })
+    });
+  }
+
+  const token = await issuePassToken(clientIP, key, PASS_LEVEL.TURNSTILE);
+  return new Response(null, {
+    status: 303,
+    headers: noStoreHeaders({
+      Location: returnTo,
+      'Set-Cookie': buildCookie(token)
+    })
   });
 }
 
 export default {
   async fetch(request) {
     try {
+      if (!SECRET_KEY) {
+        return misconfiguredSecretResponse();
+      }
+
+      const url = new URL(request.url);
       const key = await getCachedKey();
+
+      if (url.pathname === POW_VERIFY_PATH && request.method === 'POST') {
+        return handlePowVerification(request, key);
+      }
+
+      if (url.pathname === TURNSTILE_VERIFY_PATH && request.method === 'POST') {
+        if (!isTurnstileConfigured()) return misconfiguredTurnstileResponse();
+        return handleTurnstileVerification(request, key);
+      }
+
+      const riskLevel = getRiskLevel(request);
+      if (riskLevel === RISK_LEVEL.CLEAN) {
+        return fetch(request);
+      }
+
       const clientIP = request.headers.get('CF-Connecting-IP') || '';
       const cookieHeader = request.headers.get('Cookie') || '';
-      const token = getCookie(cookieHeader, TOKEN_COOKIE);
-
-      // 若无 token 或格式不对 => challenge
-      if (!token || token.indexOf(':') === -1) {
-        return challengeResponse(clientIP, key);
+      const passToken = getCookie(cookieHeader, TOKEN_COOKIE);
+      const passState = await parseAndValidatePassToken(passToken, clientIP, key);
+      const canBypassLowRisk = passState.valid;
+      const canBypassHighRisk = passState.valid && passState.level === PASS_LEVEL.TURNSTILE;
+      if ((riskLevel === RISK_LEVEL.LOW && canBypassLowRisk) || (riskLevel === RISK_LEVEL.HIGH && canBypassHighRisk)) {
+        return fetch(request);
       }
 
-      // token = expiry:hexsig
-      const [tsStr, sigHex] = token.split(':');
-      const expiry = parseInt(tsStr, 10);
-      if (isNaN(expiry)) return challengeResponse(clientIP, key);
+      const returnTo = safeReturnPath(`${url.pathname}${url.search}`);
 
-      const now = Math.floor(Date.now() / 1000);
-      if (now > expiry) return challengeResponse(clientIP, key); // 过期
-
-      // 验证签名（使用 verify）
-      const payload = `${clientIP}:${expiry}`;
-      const sigBytes = hexToUint8Array(sigHex);
-      let ok = false;
-      try {
-        ok = await crypto.subtle.verify('HMAC', key, sigBytes, encoder.encode(payload));
-      } catch (e) {
-        // 若 verify 抛错则视为不合法
-        ok = false;
+      if (riskLevel === RISK_LEVEL.HIGH) {
+        if (!isTurnstileConfigured()) return misconfiguredTurnstileResponse();
+        return new Response(renderTurnstilePage(returnTo), {
+          status: 403,
+          headers: noStoreHeaders({ 'Content-Type': 'text/html; charset=utf-8' })
+        });
       }
-      if (!ok) return challengeResponse(clientIP, key);
 
-      // 通过验证，放行到 origin
-      return fetch(request);
+      return buildPowChallengeResponse(returnTo, clientIP, key);
     } catch (err) {
-      // 在生产可减少日志细节
-      console.error('Worker error:', err && err.stack ? err.stack : err);
+      console.error('Snippet error:', err && err.stack ? err.stack : err);
       return new Response('Error', { status: 500 });
     }
   }
