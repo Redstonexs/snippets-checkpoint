@@ -4,6 +4,7 @@ const TURNSTILE_SITE_KEY = '';
 const TURNSTILE_SECRET_KEY = '';
 
 const TOKEN_COOKIE = 'cf_token';
+const HWFP_COOKIE = '__cf_hwfp';
 const COOKIE_MAX_AGE = 300;
 const FAIL_OPEN_ON_MISCONFIG = true;
 
@@ -23,6 +24,33 @@ const HIGH_RISK_SCORE_THRESHOLD = 7;
 const LOW_RISK_SCORE_THRESHOLD = 3;
 const HTTP11_POW_SCORE_BONUS = 3;
 const ASN_POW_SCORE_BONUS = 3;
+
+// Hardware fingerprint risk score weights
+const HWFP_NO_FINGERPRINT_SCORE = 0;       // Missing fingerprint alone isn't penalized (JS may not have run yet)
+const HWFP_NO_GPU_SCORE = 3;               // No WebGL renderer or using software/swiftshader
+const HWFP_HEADLESS_GPU_SCORE = 4;         // Known headless/virtual GPU strings
+const HWFP_NO_SCREEN_SCORE = 2;            // Missing or zero screen dimensions
+const HWFP_TINY_SCREEN_SCORE = 1;          // Unrealistically small screens (< 200px)
+const HWFP_NO_MEDIA_DEVICES_SCORE = 2;     // No camera AND no microphone
+const HWFP_LOW_CPU_CORES_SCORE = 1;        // Suspiciously low CPU cores (0 or undefined)
+const HWFP_NO_TOUCH_NO_MOUSE_SCORE = 1;    // Neither touch nor mouse pointer
+const HWFP_ZERO_MEMORY_SCORE = 1;          // Device memory reported as 0
+const HWFP_NO_AUDIO_SCORE = 1;             // AudioContext unavailable
+const HWFP_LOW_COLOR_DEPTH_SCORE = 1;      // Color depth < 15 bits
+const HWFP_INCONSISTENT_PIXRATIO_SCORE = 1;// Device pixel ratio of 0
+
+// Known headless / virtual GPU renderer substrings (lowercased for matching)
+const HEADLESS_GPU_PATTERNS = [
+  'swiftshader',
+  'llvmpipe',
+  'softpipe',
+  'software rasterizer',
+  'microsoft basic render',
+  'vmware svga',
+  'virtualbox',
+  'chrome os',        // Sometimes spoofed in headless
+  'google swiftshader'
+];
 
 const AUTOMATION_UA_PATTERN = /(curl|wget|python-requests|aiohttp|httpclient|okhttp|go-http-client|powershell|java\/|libwww-perl|scrapy|postmanruntime|insomnia|node-fetch|axios)/i;
 
@@ -103,6 +131,110 @@ function getCookie(cookieHeader, name) {
     if (key === name) return decodeURIComponent(value);
   }
   return null;
+}
+
+/**
+ * Parse the hardware fingerprint cookie.
+ * Expected format: base64-encoded JSON with keys:
+ *   gpu, sw, sh, cd, pr, mc, ac, tp, mm, bt, cn, md
+ * Returns null if missing or malformed.
+ */
+function parseHardwareFingerprint(cookieHeader) {
+  const raw = getCookie(cookieHeader, HWFP_COOKIE);
+  if (!raw) return null;
+
+  try {
+    const json = atob(raw);
+    if (json.length > 2048) return null; // guard against oversized payloads
+    const fp = JSON.parse(json);
+    if (typeof fp !== 'object' || fp === null || Array.isArray(fp)) return null;
+    return fp;
+  } catch (_err) {
+    return null;
+  }
+}
+
+/**
+ * Score hardware fingerprint anomalies.
+ * Returns a non-negative integer to add to the overall risk score.
+ */
+function scoreHardwareFingerprint(fp) {
+  if (!fp) return HWFP_NO_FINGERPRINT_SCORE;
+
+  let hwScore = 0;
+
+  // --- GPU / WebGL renderer ---
+  const gpu = typeof fp.gpu === 'string' ? fp.gpu.trim() : '';
+  if (!gpu) {
+    hwScore += HWFP_NO_GPU_SCORE;
+  } else {
+    const gpuLower = gpu.toLowerCase();
+    for (let i = 0; i < HEADLESS_GPU_PATTERNS.length; i++) {
+      if (gpuLower.includes(HEADLESS_GPU_PATTERNS[i])) {
+        hwScore += HWFP_HEADLESS_GPU_SCORE;
+        break;
+      }
+    }
+  }
+
+  // --- Screen dimensions ---
+  const sw = Number(fp.sw);
+  const sh = Number(fp.sh);
+  if (!Number.isFinite(sw) || !Number.isFinite(sh) || sw === 0 || sh === 0) {
+    hwScore += HWFP_NO_SCREEN_SCORE;
+  } else if (sw < 200 || sh < 200) {
+    hwScore += HWFP_TINY_SCREEN_SCORE;
+  }
+
+  // --- Color depth ---
+  const cd = Number(fp.cd);
+  if (Number.isFinite(cd) && cd > 0 && cd < 15) {
+    hwScore += HWFP_LOW_COLOR_DEPTH_SCORE;
+  }
+
+  // --- Device pixel ratio ---
+  const pr = Number(fp.pr);
+  if (Number.isFinite(pr) && pr === 0) {
+    hwScore += HWFP_INCONSISTENT_PIXRATIO_SCORE;
+  }
+
+  // --- Media devices (camera + microphone) ---
+  // mc = media device count (cameras + mics); -1 means API unavailable
+  const mc = Number(fp.mc);
+  if (Number.isFinite(mc) && mc === 0) {
+    hwScore += HWFP_NO_MEDIA_DEVICES_SCORE;
+  }
+
+  // --- AudioContext ---
+  const ac = fp.ac; // boolean or 0/1
+  if (ac === false || ac === 0) {
+    hwScore += HWFP_NO_AUDIO_SCORE;
+  }
+
+  // --- Touch + mouse pointer ---
+  const tp = Number(fp.tp); // touch max points
+  const mm = fp.mm;          // has mouse (boolean)
+  if ((!Number.isFinite(tp) || tp === 0) && (mm === false || mm === 0)) {
+    hwScore += HWFP_NO_TOUCH_NO_MOUSE_SCORE;
+  }
+
+  // --- Battery ---
+  // bt: -1 = API unavailable, 0 = battery level 0 (likely spoofed), >0 = real level
+  // Skipped for risk — battery API is being removed from browsers
+
+  // --- CPU cores ---
+  const cn = Number(fp.cn);
+  if (Number.isFinite(cn) && cn < 1) {
+    hwScore += HWFP_LOW_CPU_CORES_SCORE;
+  }
+
+  // --- Device memory ---
+  const md = Number(fp.md);
+  if (Number.isFinite(md) && md === 0) {
+    hwScore += HWFP_ZERO_MEMORY_SCORE;
+  }
+
+  return hwScore;
 }
 
 function nowInSeconds() {
@@ -252,6 +384,11 @@ function getRiskLevel(request) {
     score += 2;
   }
 
+  // --- Hardware fingerprint scoring ---
+  const cookieHeader = (headers.get('Cookie') || '');
+  const hwfp = parseHardwareFingerprint(cookieHeader);
+  score += scoreHardwareFingerprint(hwfp);
+
   if (score >= HIGH_RISK_SCORE_THRESHOLD) return RISK_LEVEL.HIGH;
   if (score >= LOW_RISK_SCORE_THRESHOLD) return RISK_LEVEL.LOW;
   return RISK_LEVEL.CLEAN;
@@ -301,6 +438,7 @@ async function parseAndValidatePassToken(token, clientIP, key) {
 
 function renderTurnstilePage(returnTo, errorText) {
   const safeReturnTo = escapeHtml(returnTo);
+  const hwfpScript = getHwFingerprintScript();
   const message = errorText
     ? `<p class="error">${escapeHtml(errorText)}</p>`
     : '<p class="hint">High-risk traffic requires a human verification.</p>';
@@ -375,8 +513,115 @@ function renderTurnstilePage(returnTo, errorText) {
         <button class="submit" type="submit">Continue</button>
       </form>
     </main>
+    ${hwfpScript}
   </body>
 </html>`;
+}
+
+/**
+ * Generate the client-side hardware fingerprint collection script.
+ * This script runs in the browser, gathers hardware signals, and stores
+ * the result in a cookie so the server can read it on subsequent requests.
+ *
+ * Collected signals:
+ *   gpu  - WebGL unmasked renderer string
+ *   sw   - screen.width
+ *   sh   - screen.height
+ *   cd   - screen.colorDepth
+ *   pr   - devicePixelRatio
+ *   mc   - media device count (audioinput + videoinput), -1 if API unavailable
+ *   ac   - AudioContext available (1/0)
+ *   tp   - maxTouchPoints
+ *   mm   - has mouse pointer (1/0)
+ *   bt   - battery level (0-100 or -1 if unavailable)
+ *   cn   - hardwareConcurrency (CPU cores)
+ *   md   - deviceMemory (GB, 0 if unavailable)
+ */
+function getHwFingerprintScript() {
+  return `<script>
+(function(){
+  try {
+    if (document.cookie.indexOf('${HWFP_COOKIE}=') !== -1) return;
+
+    var fp = {};
+
+    // GPU / WebGL renderer
+    try {
+      var c = document.createElement('canvas');
+      var gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+      if (gl) {
+        var ext = gl.getExtension('WEBGL_debug_renderer_info');
+        fp.gpu = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : '';
+      } else {
+        fp.gpu = '';
+      }
+    } catch(e) { fp.gpu = ''; }
+
+    // Screen
+    fp.sw = screen.width || 0;
+    fp.sh = screen.height || 0;
+    fp.cd = screen.colorDepth || 0;
+    fp.pr = window.devicePixelRatio || 0;
+
+    // Media devices (cameras + microphones)
+    fp.mc = -1;
+    function finalize() {
+      // AudioContext
+      try {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        fp.ac = AC ? 1 : 0;
+      } catch(e) { fp.ac = 0; }
+
+      // Touch
+      fp.tp = navigator.maxTouchPoints || 0;
+
+      // Mouse pointer
+      try {
+        fp.mm = window.matchMedia('(pointer: fine)').matches ? 1 : 0;
+      } catch(e) { fp.mm = 0; }
+
+      // CPU
+      fp.cn = navigator.hardwareConcurrency || 0;
+
+      // Device memory
+      fp.md = navigator.deviceMemory || 0;
+
+      // Battery
+      fp.bt = -1;
+      if (navigator.getBattery) {
+        navigator.getBattery().then(function(b) {
+          fp.bt = Math.round(b.level * 100);
+          writeCookie();
+        }).catch(function() { writeCookie(); });
+      } else {
+        writeCookie();
+      }
+    }
+
+    function writeCookie() {
+      try {
+        var val = btoa(JSON.stringify(fp));
+        document.cookie = '${HWFP_COOKIE}=' + encodeURIComponent(val) + '; path=/; max-age=300; SameSite=Lax; Secure';
+      } catch(e) {}
+    }
+
+    // Enumerate media devices
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      navigator.mediaDevices.enumerateDevices().then(function(devices) {
+        var count = 0;
+        for (var i = 0; i < devices.length; i++) {
+          var k = devices[i].kind;
+          if (k === 'audioinput' || k === 'videoinput') count++;
+        }
+        fp.mc = count;
+        finalize();
+      }).catch(function() { finalize(); });
+    } else {
+      finalize();
+    }
+  } catch(e) {}
+})();
+<\/script>`;
 }
 
 function randomHex(byteLength) {
@@ -402,6 +647,7 @@ async function issuePowChallenge(clientIP, key) {
 
 function renderPowPage(challenge, returnTo, errorText) {
   const safeReturnTo = escapeHtml(returnTo);
+  const hwfpScript = getHwFingerprintScript();
   const message = errorText
     ? `<p class="error">${escapeHtml(errorText)}</p>`
     : '<p class="hint">Low-risk suspicious traffic must complete a PoW check.</p>';
@@ -532,6 +778,7 @@ function renderPowPage(challenge, returnTo, errorText) {
         }
       })();
     </script>
+    ${hwfpScript}
   </body>
 </html>`;
 }
